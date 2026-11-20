@@ -158,13 +158,20 @@ public final class CameraStreamService extends Service {
         long wallStart = System.currentTimeMillis();
         long deadline = seconds > 0 ? wallStart + seconds * 1000L : Long.MAX_VALUE;
 
-        // 本地录制同样要保 CPU 不休眠，避免眼镜待机冻住编码器
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        if (pm != null) {
-            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fusion:camera-record");
-            mWakeLock.setReferenceCounted(false);
-            mWakeLock.acquire();
-            log("wake lock acquired");
+        // 本地录制同样要保 CPU 不休眠，避免眼镜待机冻住编码器。
+        // 0.3.9 曾因 Manifest 漏声明 WAKE_LOCK 让 acquire() 抛 SecurityException
+        // 直接打死录制线程 —— 这里必须包住，权限异常最多只是不持锁，不能让整路录制崩掉。
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fusion:camera-record");
+                mWakeLock.setReferenceCounted(false);
+                mWakeLock.acquire();
+                log("wake lock acquired");
+            }
+        } catch (Throwable t) {
+            log("wake lock unavailable (继续录制，不持锁): " + t);
+            mWakeLock = null;
         }
         log("start uid=" + android.os.Process.myUid() + " -> " + path
                 + " " + width + "x" + height + " @" + fps + "fps " + bitrate + "bps"

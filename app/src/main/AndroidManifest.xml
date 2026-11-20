@@ -20,6 +20,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      WAKE_LOCK：0.3.9 起录制期间持 PARTIAL_WAKE_LOCK 保 CPU 不休眠。
+      之前漏声明，acquire() 直接抛 SecurityException 把相机服务线程打死
+      （真机 crash buffer 实测），这也是 0.3.9「两路同时冻结」的真实根因。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
