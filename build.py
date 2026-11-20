@@ -54,13 +54,28 @@ def run(cmd, env=None, capture=False):
     r = subprocess.run([str(c) for c in cmd], env=env,
                         stdout=subprocess.PIPE if capture else None,
                         stderr=subprocess.STDOUT if capture else None,
-                        text=True)
+                        text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         if capture:
             print((r.stdout or "")[-4000:])
         print("!!! FAILED rc=%d" % r.returncode)
         sys.exit(r.returncode)
     return (r.stdout or "").strip() if capture else ""
+
+
+def tool_path(path):
+    """Windows 下把无后缀工具名解析成真实的 .exe/.bat，Linux 原样返回。
+
+    SDK build-tools 在 Windows 上给出的是 aapt2.exe / zipalign.exe / apksigner.bat，
+    而脚本按 Linux 习惯写 "aapt2"。照抄原路径会在自检阶段直接失败。
+    """
+    if os.path.isfile(path):
+        return path
+    for ext in (".exe", ".bat", ".cmd"):
+        candidate = path + ext
+        if os.path.isfile(candidate):
+            return candidate
+    return path  # 保持原值，交给后面的自检给出明确报错
 
 
 def find_sdk(explicit):
@@ -77,12 +92,15 @@ def find_sdk(explicit):
 
 def find_jdk():
     javac = shutil.which("javac")
-    if not javac:
-        sys.exit("找不到 javac")
-    home = os.path.dirname(os.path.dirname(os.path.realpath(javac)))
-    if not os.path.isfile(os.path.join(home, "bin", "keytool")):
-        # zulu / sdkman 之类可能把 java 放在别处
-        home = os.environ.get("JAVA_HOME", home)
+    home = os.environ.get("JAVA_HOME")
+    if javac:
+        candidate = os.path.dirname(os.path.dirname(os.path.realpath(javac)))
+        bindir = os.path.join(candidate, "bin")
+        if (os.path.isfile(os.path.join(bindir, "javac"))
+                or os.path.isfile(os.path.join(bindir, "javac.exe"))):
+            home = candidate
+    if not home:
+        sys.exit("找不到 javac（设置 JAVA_HOME 或把 JDK/bin 加进 PATH）")
     return home
 
 
@@ -92,13 +110,22 @@ class Env:
         self.jdk = jdk
         bt = os.path.join(sdk, "build-tools", "35.0.0")
         self.android_jar = os.path.join(sdk, "platforms", "android-35", "android.jar")
-        self.aapt2 = os.path.join(bt, "aapt2")
-        self.zipalign = os.path.join(bt, "zipalign")
-        self.apksigner = os.path.join(bt, "apksigner")
+        self.aapt2 = tool_path(os.path.join(bt, "aapt2"))
+        self.zipalign = tool_path(os.path.join(bt, "zipalign"))
         self.d8jar = os.path.join(bt, "lib", "d8.jar")
-        self.javac = os.path.join(jdk, "bin", "javac")
-        self.java = os.path.join(jdk, "bin", "java")
-        self.keytool = os.path.join(jdk, "bin", "keytool")
+        self.javac = tool_path(os.path.join(jdk, "bin", "javac"))
+        self.java = tool_path(os.path.join(jdk, "bin", "java"))
+        self.keytool = tool_path(os.path.join(jdk, "bin", "keytool"))
+        # Windows 的 build-tools 只提供 apksigner.bat，Python subprocess 不能直接启动 .bat。
+        # 直接走 jar 里的 main class，Linux / Windows 行为一致。
+        self.apksigner_jar = os.path.join(bt, "lib", "apksigner.jar")
+        if os.path.isfile(self.apksigner_jar):
+            self.apksigner = self.apksigner_jar
+            self.apksigner_cmd = [self.java, "-cp", self.apksigner_jar,
+                                  "com.android.apksigner.ApkSignerTool"]
+        else:
+            self.apksigner = tool_path(os.path.join(bt, "apksigner"))
+            self.apksigner_cmd = [self.apksigner]
         self.env = dict(os.environ)
         self.env["JAVA_HOME"] = jdk
         self.env["ANDROID_HOME"] = sdk
@@ -182,7 +209,7 @@ def build_apk(e):
     log("[6/7] apksigner 签名")
     apk = os.path.join(DIST, "fusion-capture.apk")
     # 同时启用 v1/v2/v3：定制 ROM 对 v3 的实现未必完整，三种都签最保险
-    run([e.apksigner, "sign", "--ks", KS,
+    run(e.apksigner_cmd + ["sign", "--ks", KS,
          "--ks-pass", "pass:" + KS_PASS, "--key-pass", "pass:" + KS_PASS,
          "--ks-key-alias", KS_ALIAS, "--min-sdk-version", MIN_SDK,
          "--v1-signing-enabled", "true", "--v2-signing-enabled", "true",
@@ -215,7 +242,7 @@ def build_screen_dex(e):
 def verify(e, apk, jar):
     log("静态校验产物")
     # 用低 minSdk 强制把 v1/v2/v3 三种方案都验一遍，避免默认按 28 只报 v3 造成误读
-    print(run([e.apksigner, "verify", "--verbose", "--print-certs",
+    print(run(e.apksigner_cmd + ["verify", "--verbose", "--print-certs",
               "--min-sdk-version", "23", apk], env=e.env, capture=True)[:1500])
     badging = run([e.aapt2, "dump", "badging", apk], env=e.env, capture=True)
     for line in badging.splitlines():

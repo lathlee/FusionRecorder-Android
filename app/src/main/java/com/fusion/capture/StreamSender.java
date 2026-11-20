@@ -37,12 +37,43 @@ public final class StreamSender implements AutoCloseable {
     private int frames = 0;
     private int heartbeats = 0;
 
+    /** 连接重试总时长上限（毫秒）。采集端冷启动比 iPhone 开监听快，首连常被拒。 */
+    private static final long CONNECT_RETRY_TOTAL_MS = 45_000;
+    private static final long CONNECT_RETRY_INTERVAL_MS = 1_000;
+
     public StreamSender(String host, int port, int streamId, boolean ptsEnabled,
                          int connectTimeoutMs) throws IOException {
         this.streamId = streamId;
         this.ptsEnabled = ptsEnabled;
-        Socket s = new Socket();
-        s.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+        // 带重试的连接：iPhone 全自动流程是「部署完（启动采集）→ 才开监听」，
+        // 相机流冷启动快，常常在监听起来前首连被 ECONNREFUSED。
+        // 之前一次失败就 FATAL 退出，导致相机流 0 帧、成片只靠屏幕流 → 卡在封装。
+        // 2026-11-20 真机实测确认，改为重试到监听就绪。
+        Socket s = null;
+        IOException lastError = null;
+        long deadline = SystemClock.elapsedRealtime() + CONNECT_RETRY_TOTAL_MS;
+        int attempt = 0;
+        while (s == null && SystemClock.elapsedRealtime() < deadline) {
+            attempt++;
+            Socket candidate = new Socket();
+            try {
+                candidate.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+                s = candidate;                       // 成功
+                System.out.println("[FUSION-" + (streamId == 1 ? "SCREEN" : "CAM")
+                        + "] connect ok on attempt " + attempt + " -> " + host + ":" + port);
+            } catch (IOException e) {
+                lastError = e;
+                try { candidate.close(); } catch (Throwable ignored) {}
+                System.out.println("[FUSION-" + (streamId == 1 ? "SCREEN" : "CAM")
+                        + "] connect attempt " + attempt + " failed: " + e.getMessage());
+                try { Thread.sleep(CONNECT_RETRY_INTERVAL_MS); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+        }
+        if (s == null) {
+            throw new IOException("connect to " + host + ":" + port + " failed after "
+                    + attempt + " attempts / " + CONNECT_RETRY_TOTAL_MS + "ms", lastError);
+        }
         s.setTcpNoDelay(true);
         try {
             s.setSendBufferSize(256 * 1024);
