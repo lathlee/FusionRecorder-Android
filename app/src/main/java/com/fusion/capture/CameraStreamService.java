@@ -20,6 +20,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Log;
 import android.view.Surface;
 
@@ -85,6 +86,7 @@ public final class CameraStreamService extends Service {
     private StreamSender mSender;
     private HandlerThread mCamThread;
     private Thread mWorker;
+    private PowerManager.WakeLock mWakeLock;
 
     private static void log(String s) {
         Log.i(TAG, s);
@@ -163,6 +165,15 @@ public final class CameraStreamService extends Service {
                            boolean pts, int repeatUs) {
         long wallStart = System.currentTimeMillis();
         long deadline = seconds > 0 ? wallStart + seconds * 1000L : Long.MAX_VALUE;
+        // 眼镜熄屏/待机时系统可能冻结相机进程、断开 TCP —— 全程持 PARTIAL_WAKE_LOCK
+        // 保 CPU 不休眠（屏幕流靠独立进程 + 常亮设置，这路单独兜底）。
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm != null) {
+            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fusion:camera-stream");
+            mWakeLock.setReferenceCounted(false);
+            mWakeLock.acquire();
+            log("wake lock acquired");
+        }
         log("start uid=" + android.os.Process.myUid() + " -> " + host + ":" + port
                 + " " + width + "x" + height + " @" + fps + "fps " + bitrate + "bps"
                 + " pts=" + pts + " sec=" + (seconds > 0 ? seconds : "unlimited"));
@@ -315,6 +326,7 @@ public final class CameraStreamService extends Service {
                     log("t=" + (now - wallStart) / 1000.0 + "s frames=" + mSender.frames()
                             + " fps=" + String.format("%.1f", fpsNow)
                             + " bytes=" + mSender.totalBytes()
+                            + " reconnects=" + mSender.reconnects()
                             + " heartbeat=" + mSender.heartbeats());
                     framesSinceReport = 0;
                     lastReport = now;
@@ -322,12 +334,18 @@ public final class CameraStreamService extends Service {
             }
             mSender.flush();
             log("DONE frames=" + mSender.frames() + " bytes=" + mSender.totalBytes()
+                    + " reconnects=" + mSender.reconnects()
                     + " elapsed=" + (System.currentTimeMillis() - wallStart) + "ms");
         } catch (Throwable t) {
             log("FATAL " + t);
             t.printStackTrace(System.out);
         } finally {
             cleanup();
+            if (mWakeLock != null) {
+                try { mWakeLock.release(); } catch (Throwable ignored) {}
+                log("wake lock released");
+                mWakeLock = null;
+            }
             mRunning = false;
             stopForeground(true);
             stopSelf();
