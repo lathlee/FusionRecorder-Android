@@ -251,9 +251,14 @@ public final class Mp4Recorder {
         muxer = null;
         released = true;
 
+        // ★ MediaMuxer 用 0600 创建文件，属主是当前 uid。
+        // 相机 mp4 属于 App uid(101xx)，而 ADB pull 走 shell(2000) 读 ——
+        // 不改权限会直接 "remote open failed: Permission denied"。
+        File out = new File(path);
+        try { out.setReadable(true, false); } catch (Throwable ignored) {}
+
         long ms = lastWrittenPTS > firstPTS && firstPTS > 0
                 ? (lastWrittenPTS - firstPTS) / 1000L : 0L;
-        File out = new File(path);
         log("DONE file=" + path + " bytes=" + (out.exists() ? out.length() : 0)
                 + " frames=" + frameCount + " span=" + ms + "ms");
     }
