@@ -69,7 +69,9 @@ public final class CameraStreamService extends Service {
 
     public static final String ACTION_STOP = "com.fusion.capture.STOP_CAMERA";
 
-    public static final String DEFAULT_PATH = "/data/local/tmp/fusion_camera.mp4";
+    // /data/local/tmp 是 0771，App uid 写不进去（实测 EACCES）。
+    // 默认落到 shell 预建的 777 子目录；调用方通常也会显式传 path。
+    public static final String DEFAULT_PATH = "/data/local/tmp/fusion/fusion_camera.mp4";
     private static final int DEFAULT_WIDTH = 640;
     private static final int DEFAULT_HEIGHT = 480;
     private static final int DEFAULT_FPS = 30;

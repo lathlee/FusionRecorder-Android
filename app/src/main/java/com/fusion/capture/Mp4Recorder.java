@@ -257,6 +257,30 @@ public final class Mp4Recorder {
         File out = new File(path);
         try { out.setReadable(true, false); } catch (Throwable ignored) {}
 
+        // ★ 两行 sidecar：
+        //   第 1 行 = 本路首帧的绝对 pts（elapsedRealtime 微秒）
+        //   第 2 行 = 本路结束时刻（同钟）
+        // 为什么需要第 1 行：MediaMuxer 会把首帧 pts 归一化成 0，mp4 读出来两路都从 0 开始；
+        // 而两路启动有先后（实测差 1.3 秒），没有这个偏移就无法做真正的绝对时间对齐。
+        // 为什么需要第 2 行：VFR 录制在画面静止时产帧很少，mp4 自带 duration 会短于
+        // 实际录制时长，必须用真实结束时刻做终点。
+        try {
+            long endUs = SystemClock.elapsedRealtimeNanos() / 1000L;
+            File metaFile = new File(path + ".meta");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(metaFile);
+            try {
+                String content = (firstPTS > 0 ? firstPTS : 0) + "\n" + endUs;
+                fos.write(content.getBytes("UTF-8"));
+                fos.flush();
+            } finally {
+                fos.close();
+            }
+            metaFile.setReadable(true, false);
+            log("meta " + metaFile.getAbsolutePath() + " first=" + firstPTS + " end=" + endUs);
+        } catch (Throwable t) {
+            log("write meta failed: " + t);
+        }
+
         long ms = lastWrittenPTS > firstPTS && firstPTS > 0
                 ? (lastWrittenPTS - firstPTS) / 1000L : 0L;
         log("DONE file=" + path + " bytes=" + (out.exists() ? out.length() : 0)
