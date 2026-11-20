@@ -222,11 +222,11 @@ def build_screen_dex(e):
     log("[7/7] 构建 screen-push.jar（shell uid dex）")
     obj = os.path.join(BUILD, "screen_obj")
     dex = os.path.join(BUILD, "screen_dex")
-    # 与 APK 共用 PtsSei / StreamSender 两份源码：pts 编码逻辑单一真源
+    # 0.4.0 离线架构：screen dex 与 APK 共用 Mp4Recorder
+    #（MediaCodec + MediaMuxer 本地写 mp4，两路共用一个实现，pts 时基一致）
     shared = os.path.join(APP, "java", "com", "fusion", "capture")
     srcs = glob.glob(os.path.join(SCREEN, "**", "*.java"), recursive=True)
-    srcs += [os.path.join(shared, "PtsSei.java"),
-             os.path.join(shared, "StreamSender.java")]
+    srcs += [os.path.join(shared, "Mp4Recorder.java")]
     run([e.javac, "-encoding", "UTF-8", "--release", RELEASE, "-nowarn",
          "-classpath", e.android_jar, "-d", obj] + srcs, env=e.env)
     classes = glob.glob(os.path.join(obj, "**", "*.class"), recursive=True)

@@ -60,8 +60,15 @@ public final class CaptureReceiver extends BroadcastReceiver {
                 break;
             }
             case ACTION_STOP_CAMERA:
-                context.stopService(new Intent(context, CameraStreamService.class));
-                log("STOP_CAMERA");
+                // 0.4.0：不能直接 stopService —— 那会让 onDestroy 立刻打断 muxer，
+                // mp4 缺 moov。改成带 ACTION_STOP 再 start 一次，让服务自己
+                // 置停止标志、drain 完残留帧、写完 mp4 再 stopSelf()。
+                {
+                    Intent stop = new Intent(context, CameraStreamService.class);
+                    stop.setAction(CameraStreamService.ACTION_STOP);
+                    context.startService(stop);
+                    log("STOP_CAMERA (graceful)");
+                }
                 break;
             case ACTION_KEEPALIVE: {
                 Intent a = new Intent(context, KeepAliveActivity.class);

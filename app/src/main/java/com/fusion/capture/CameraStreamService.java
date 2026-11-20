@@ -13,9 +13,6 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
-import android.media.MediaCodec;
-import android.media.MediaCodecInfo;
-import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -24,30 +21,31 @@ import android.os.PowerManager;
 import android.util.Log;
 import android.view.Surface;
 
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 相机流采集（第二路，TCP 9115）。
+ * 相机本地录制服务（第二路）—— 离线录制架构 0.4.0 起替代 TCP 9115 推流。
  *
- * 必须以「装了 APK 的 App 进程」身份运行：shell(uid=2000) 开不了相机
- * （Camera1 会 native abort，Camera2 抛 SecurityException），只有持有
- * android.permission.CAMERA 的应用 uid 才能打开摄像头。见交接包 §2.3。
+ * 链路：Camera2 → MediaCodec.createInputSurface() → MediaMuxer →
+ *       /data/local/tmp/fusion_camera.mp4
  *
- * 链路：Camera2 → MediaCodec.createInputSurface() → H264 Annex-B → 裸 TCP。
- * 前台服务、无 UI、不抢焦点，因此 shell uid 的虚拟屏镜像抓到的是真实 HUD，
- * 而不是「● 录制中」这种采集 App 自己的界面。
+ * 必须以「装了 APK 的 App 进程」身份运行：shell(uid=2000) 开不了相机。
+ * 前台服务、无 UI、不抢焦点，因此 shell uid 的虚拟屏镜像抓到的是真实 HUD。
  *
- * 启动（iPhone 端通过无线 ADB 发送）：
+ * 启动（iPhone 端通过无线 ADB 下发）：
  * <pre>
- * adb shell am start-foreground-service -n com.fusion.capture/.CameraStreamService \
- *   --es host 172.20.10.1 --ei port 9115 --ei sec 0 \
- *   --ei width 640 --ei height 480 --ei fps 30 --ei bitrate 2000000 --ei pts 1
+ * am start-foreground-service -n com.fusion.capture/.CameraStreamService \
+ *   --es path /data/local/tmp/fusion_camera.mp4 --ei sec 0 \
+ *   --ei width 640 --ei height 480 --ei fps 30 --ei bitrate 2000000 --ei iframe 2
  * </pre>
  *
- * 停止：见 {@link CaptureReceiver} 的 STOP_CAMERA 广播，或直接断开 9115 TCP。
+ * 停止（走 onStartCommand 的 ACTION_STOP，让 worker 有机会把 mp4 moov 写完）：
+ * <pre>
+ * am startservice -n com.fusion.capture/.CameraStreamService \
+ *   -a com.fusion.capture.STOP_CAMERA
+ * </pre>
  */
 public final class CameraStreamService extends Service {
 
@@ -55,7 +53,7 @@ public final class CameraStreamService extends Service {
     private static final String CHANNEL_ID = "fusion_capture_cam";
     private static final int NOTIFICATION_ID = 2033;
 
-    // ---- intent extra 名（DEPLOY.md / PROTOCOL.md 中的命令按这些名字传参）----
+    // ---- intent extra 名（兼容旧字段：host/port/pts 保留但不再使用）----
     public static final String EXTRA_HOST = "host";
     public static final String EXTRA_PORT = "port";
     public static final String EXTRA_SEC = "sec";
@@ -67,23 +65,22 @@ public final class CameraStreamService extends Service {
     public static final String EXTRA_CAMERA_ID = "camera";
     public static final String EXTRA_PTS = "pts";
     public static final String EXTRA_REPEAT_US = "repeat_us";
+    public static final String EXTRA_PATH = "path";
 
     public static final String ACTION_STOP = "com.fusion.capture.STOP_CAMERA";
 
-    private static final int DEFAULT_PORT = 9115;
+    public static final String DEFAULT_PATH = "/data/local/tmp/fusion_camera.mp4";
     private static final int DEFAULT_WIDTH = 640;
     private static final int DEFAULT_HEIGHT = 480;
     private static final int DEFAULT_FPS = 30;
     private static final int DEFAULT_BITRATE = 2_000_000;
     private static final int DEFAULT_IFRAME = 2;
-    private static final int CONNECT_TIMEOUT_MS = 5000;
 
     private volatile boolean mRunning = false;
     private volatile boolean mStopping = false;
-    private MediaCodec mCodec;
+    private Mp4Recorder mRecorder;
     private CameraDevice mCamera;
     private CameraCaptureSession mSession;
-    private StreamSender mSender;
     private HandlerThread mCamThread;
     private Thread mWorker;
     private PowerManager.WakeLock mWakeLock;
@@ -102,7 +99,7 @@ public final class CameraStreamService extends Service {
             if (nm != null) {
                 NotificationChannel ch = new NotificationChannel(CHANNEL_ID,
                         "融合采集 · 相机流", NotificationManager.IMPORTANCE_LOW);
-                ch.setDescription("Camera2 H264 over TCP 9115");
+                ch.setDescription("Camera2 H264 → local mp4");
                 nm.createNotificationChannel(ch);
             }
         }
@@ -115,7 +112,7 @@ public final class CameraStreamService extends Service {
                 : new Notification.Builder(this);
         b.setSmallIcon(R.drawable.ic_stat_capture)
                 .setContentTitle("融合采集 · 相机流")
-                .setContentText("Camera2 H264 正在推送到 9115")
+                .setContentText("Camera2 H264 正在本地录制 mp4")
                 .setOngoing(true);
         startForeground(NOTIFICATION_ID, b.build());
     }
@@ -125,58 +122,53 @@ public final class CameraStreamService extends Service {
         enterForeground();
         String action = intent != null ? intent.getAction() : null;
         if (ACTION_STOP.equals(action)) {
-            log("STOP requested");
+            log("STOP requested (graceful: 等待 mp4 写完)");
             requestStop();
             return START_NOT_STICKY;
         }
         if (mRunning) {
-            log("already running, ignore new START (先发 STOP_CAMERA 再改参数)");
+            log("already recording, ignore new START (先发 STOP_CAMERA 再改参数)");
             return START_STICKY;
         }
 
-        String host = intent != null ? intent.getStringExtra(EXTRA_HOST) : null;
-        if (host == null || host.isEmpty()) {
-            log("FATAL: 缺少 --es host <iPhone 热点 IP>");
-            requestStop();
-            return START_NOT_STICKY;
-        }
-        int port = intent.getIntExtra(EXTRA_PORT, DEFAULT_PORT);
-        int sec = intent.getIntExtra(EXTRA_SEC, 0);           // 0 = 不限时，直到 STOP / 断开
-        int width = intent.getIntExtra(EXTRA_WIDTH, DEFAULT_WIDTH);
-        int height = intent.getIntExtra(EXTRA_HEIGHT, DEFAULT_HEIGHT);
-        int fps = intent.getIntExtra(EXTRA_FPS, DEFAULT_FPS);
-        int bitrate = intent.getIntExtra(EXTRA_BITRATE, DEFAULT_BITRATE);
-        int iframe = intent.getIntExtra(EXTRA_IFRAME, DEFAULT_IFRAME);
-        String cameraId = intent.getStringExtra(EXTRA_CAMERA_ID);
-        boolean pts = intent.getIntExtra(EXTRA_PTS, 1) != 0;
-        int repeatUs = intent.getIntExtra(EXTRA_REPEAT_US, 1_000_000 / Math.max(1, fps));
+        String path = intent != null ? intent.getStringExtra(EXTRA_PATH) : null;
+        if (path == null || path.isEmpty()) path = DEFAULT_PATH;
+        int sec = intent != null ? intent.getIntExtra(EXTRA_SEC, 0) : 0;
+        int width = intent != null ? intent.getIntExtra(EXTRA_WIDTH, DEFAULT_WIDTH) : DEFAULT_WIDTH;
+        int height = intent != null ? intent.getIntExtra(EXTRA_HEIGHT, DEFAULT_HEIGHT) : DEFAULT_HEIGHT;
+        int fps = intent != null ? intent.getIntExtra(EXTRA_FPS, DEFAULT_FPS) : DEFAULT_FPS;
+        int bitrate = intent != null ? intent.getIntExtra(EXTRA_BITRATE, DEFAULT_BITRATE) : DEFAULT_BITRATE;
+        int iframe = intent != null ? intent.getIntExtra(EXTRA_IFRAME, DEFAULT_IFRAME) : DEFAULT_IFRAME;
+        String cameraId = intent != null ? intent.getStringExtra(EXTRA_CAMERA_ID) : null;
+        int repeatUs = intent != null ? intent.getIntExtra(EXTRA_REPEAT_US, 1_000_000 / Math.max(1, fps))
+                : 1_000_000 / Math.max(1, fps);
 
         mRunning = true;
         mStopping = false;
-        final String h = host;
-        mWorker = new Thread(() -> runStream(h, port, sec, width, height, fps,
-                bitrate, iframe, cameraId, pts, repeatUs), "fusion-cam-stream");
+        final String p = path;
+        mWorker = new Thread(() -> runRecord(p, sec, width, height, fps,
+                bitrate, iframe, cameraId, repeatUs), "fusion-cam-record");
         mWorker.start();
         return START_STICKY;
     }
 
-    private void runStream(String host, int port, int seconds, int width, int height,
+    private void runRecord(String path, int seconds, int width, int height,
                            int fps, int bitrate, int iframe, String cameraId,
-                           boolean pts, int repeatUs) {
+                           int repeatUs) {
         long wallStart = System.currentTimeMillis();
         long deadline = seconds > 0 ? wallStart + seconds * 1000L : Long.MAX_VALUE;
-        // 眼镜熄屏/待机时系统可能冻结相机进程、断开 TCP —— 全程持 PARTIAL_WAKE_LOCK
-        // 保 CPU 不休眠（屏幕流靠独立进程 + 常亮设置，这路单独兜底）。
+
+        // 本地录制同样要保 CPU 不休眠，避免眼镜待机冻住编码器
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
-            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fusion:camera-stream");
+            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "fusion:camera-record");
             mWakeLock.setReferenceCounted(false);
             mWakeLock.acquire();
             log("wake lock acquired");
         }
-        log("start uid=" + android.os.Process.myUid() + " -> " + host + ":" + port
+        log("start uid=" + android.os.Process.myUid() + " -> " + path
                 + " " + width + "x" + height + " @" + fps + "fps " + bitrate + "bps"
-                + " pts=" + pts + " sec=" + (seconds > 0 ? seconds : "unlimited"));
+                + " sec=" + (seconds > 0 ? seconds : "unlimited"));
         try {
             if (checkSelfPermission(android.Manifest.permission.CAMERA)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -185,27 +177,10 @@ public final class CameraStreamService extends Service {
                 return;
             }
 
-            mSender = new StreamSender(host, port, PtsSei.STREAM_CAMERA, pts,
-                    CONNECT_TIMEOUT_MS);
-            log("socket connected " + host + ":" + port);
-
-            MediaFormat fmt = MediaFormat.createVideoFormat(
-                    MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
-            fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
-            fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-            fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iframe);
-            fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            // 静止场景也让编码器持续产帧，避免 VFR 导致接收端抓不到帧
-            if (repeatUs > 0) {
-                fmt.setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, repeatUs);
-            }
-            mCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-            mCodec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            final Surface encoderSurface = mCodec.createInputSurface();
-            mCodec.start();
-            log("encoder started " + width + "x" + height + " @" + fps
-                    + " repeatUs=" + repeatUs);
+            mRecorder = new Mp4Recorder(path, width, height, fps, bitrate,
+                    iframe, repeatUs, msg -> log(msg));
+            mRecorder.start();
+            final Surface encoderSurface = mRecorder.inputSurface();
 
             CameraManager cm = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
             String[] ids = cm.getCameraIdList();
@@ -242,7 +217,7 @@ public final class CameraStreamService extends Service {
                                             req.set(CaptureRequest.CONTROL_MODE,
                                                     CaptureRequest.CONTROL_MODE_AUTO);
                                             session.setRepeatingRequest(req.build(), null, handler);
-                                            log("repeating preview -> encoder");
+                                            log("repeating preview -> local encoder");
                                         } catch (Throwable t) {
                                             error[0] = "request: " + t;
                                         }
@@ -290,57 +265,31 @@ public final class CameraStreamService extends Service {
                 return;
             }
 
-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             long lastReport = System.currentTimeMillis();
-            int framesSinceReport = 0;
-            int seq = 0;
-
-            while (!mStopping && !mSender.isBroken()
+            int framesAtReport = 0;
+            while (!mStopping && !mRecorder.isEos()
                     && System.currentTimeMillis() < deadline) {
-                int idx = mCodec.dequeueOutputBuffer(info, 200_000);
-                if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    log("output format " + mCodec.getOutputFormat());
-                    continue;
-                }
-                if (idx < 0) continue;
-
-                ByteBuffer buf = mCodec.getOutputBuffer(idx);
-                if (buf != null && info.size > 0) {
-                    buf.position(info.offset);
-                    buf.limit(info.offset + info.size);
-                    byte[] data = new byte[info.size];
-                    buf.get(data);
-                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        // SPS/PPS：原样先送出去，接收端靠它建 VTDecompressionSession
-                        mSender.writeConfig(data);
-                    } else {
-                        mSender.writeFrame(data, seq++);
-                        framesSinceReport++;
-                    }
-                }
-                mCodec.releaseOutputBuffer(idx, false);
+                int n = mRecorder.drainOnce(200_000L);
+                if (n == 1) framesAtReport++;
+                if (n == 2) break;
 
                 long now = System.currentTimeMillis();
                 if (now - lastReport >= 2000) {
-                    double fpsNow = framesSinceReport * 1000.0 / (now - lastReport);
-                    log("t=" + (now - wallStart) / 1000.0 + "s frames=" + mSender.frames()
-                            + " fps=" + String.format("%.1f", fpsNow)
-                            + " bytes=" + mSender.totalBytes()
-                            + " reconnects=" + mSender.reconnects()
-                            + " heartbeat=" + mSender.heartbeats());
-                    framesSinceReport = 0;
+                    log("t=" + (now - wallStart) / 1000.0 + "s frames="
+                            + mRecorder.frames() + " fps=" + String.format("%.1f",
+                            framesAtReport * 1000.0 / (now - lastReport))
+                            + " pts=" + mRecorder.firstPTSUs() + ".." + mRecorder.lastPTSUs());
+                    framesAtReport = 0;
                     lastReport = now;
                 }
             }
-            mSender.flush();
-            log("DONE frames=" + mSender.frames() + " bytes=" + mSender.totalBytes()
-                    + " reconnects=" + mSender.reconnects()
+            log("DONE frames=" + mRecorder.frames()
                     + " elapsed=" + (System.currentTimeMillis() - wallStart) + "ms");
         } catch (Throwable t) {
             log("FATAL " + t);
             t.printStackTrace(System.out);
         } finally {
-            cleanup();
+            cleanup();   // 先停相机输入，再 mRecorder.stopAndRelease() 写 moov
             if (mWakeLock != null) {
                 try { mWakeLock.release(); } catch (Throwable ignored) {}
                 log("wake lock released");
@@ -368,17 +317,9 @@ public final class CameraStreamService extends Service {
             }
             mCamera = null;
         }
-        if (mCodec != null) {
-            try {
-                mCodec.stop();
-                mCodec.release();
-            } catch (Throwable ignored) {
-            }
-            mCodec = null;
-        }
-        if (mSender != null) {
-            mSender.close();   // 顺便打断可能阻塞的 socket write
-            mSender = null;
+        if (mRecorder != null) {
+            mRecorder.stopAndRelease();
+            mRecorder = null;
         }
         if (mCamThread != null) {
             mCamThread.quitSafely();
@@ -387,19 +328,14 @@ public final class CameraStreamService extends Service {
         log("cleaned up");
     }
 
+    /** 只置停止标志；真正收尾在 worker 的 finally，保证 mp4 写完。 */
     private void requestStop() {
         mStopping = true;
-        StreamSender s = mSender;
-        if (s != null) s.close();
-        stopForeground(true);
-        stopSelf();
     }
 
     @Override
     public void onDestroy() {
         mStopping = true;
-        StreamSender s = mSender;
-        if (s != null) s.close();
         super.onDestroy();
     }
 
