@@ -1,0 +1,10 @@
+# 构建生成物
+build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地状态
+.last_commit_sha

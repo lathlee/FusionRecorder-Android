@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.fusion.capture"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <!--
+      采集端权限说明：
+      - CAMERA：相机流必须以「装了 APK 的 App uid」运行才拿得到（shell uid 开不了相机）。
+      - INTERNET：Socket 裸 TCP 推流必需，缺了会 EACCES (Permission denied)。
+      - FOREGROUND_SERVICE / FOREGROUND_SERVICE_CAMERA：前台服务，5 秒内 startForeground()。
+      - POST_NOTIFICATIONS：Android 13+ 的前台服务通知。
+
+      注意：这里刻意【不】声明 CAPTURE_VIDEO_OUTPUT / MediaProjection 相关权限。
+      交接包已实测「App uid 抓不到屏幕帧」，屏幕流改由 shell(uid=2000) 的
+      app_process + SurfaceControl 虚拟屏镜像负责，与本 APK 无关。
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
+    <!--
+      纯 headless 采集端：没有 LAUNCHER Activity，桌面看不到图标。
+      这是有意的 —— 录屏期间不应该打开任何 UI，屏幕流要抓的是真实 HUD。
+      确认安装用：adb shell pm list packages | grep fusion
+    -->
+    <application
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:icon="@drawable/ic_stat_capture"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Capture.Transparent">
+
+        <!-- 透明保活：完全不绘制、不拿焦点、触摸穿透 -->
+        <activity
+            android:name=".KeepAliveActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:noHistory="false"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.Capture.Transparent" />
+
+        <!-- 相机流前台服务：Camera2 → H264 Annex-B → TCP 9115 -->
+        <service
+            android:name=".CameraStreamService"
+            android:exported="true"
+            android:foregroundServiceType="camera" />
+
+        <!-- 显式广播控制入口（iPhone 端通过无线 ADB 发） -->
+        <receiver
+            android:name=".CaptureReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.fusion.capture.START_CAMERA" />
+                <action android:name="com.fusion.capture.STOP_CAMERA" />
+                <action android:name="com.fusion.capture.KEEPALIVE" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      全透明、无标题、无 dim、无内容覆盖层。
+      屏幕流把整个 display 镜像进编码器时，这层窗口的 alpha 贡献为 0，
+      因此抓到的画面和「没有这个 Activity」时逐像素一致 —— 真实 HUD 不会被挡。
+    -->
+    <style name="Theme.Capture.Transparent"
+        parent="@android:style/Theme.Translucent.NoTitleBar.Fullscreen">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>
